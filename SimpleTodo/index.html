@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="vue.global.js"></script>
+    <script>
+const LOCAL_STORAGE_KEY = "K2369_SUPER_SIMPLE_TODO";
+const AUTO_SAVE_MSEC = 5000;
+const SELECTED_NONE = "";
+
+let app;
+let savetimer;
+
+// タスククラス
+class Task {
+    id = "";
+    title = "";
+    desc = "";
+
+    constructor(title, desc) {
+        this.id = crypto.randomUUID();
+        this.title = title;
+        this.desc = desc;
+    }
+}
+
+// 初期処理
+window.addEventListener('DOMContentLoaded', () => {
+    app = Vue.createApp({
+        data() {
+            let appData = {
+                tasks: [
+                ],
+                trush: [
+                ],
+
+                selected: SELECTED_NONE,
+
+                dragIndex: -1,   // ドラッグしている要素の元のインデックス
+                hoverIndex: -1,  // 現在マウスが重なっている想定のインデックス
+                dragOffsetY: 0,  // ドラッグ中の縦の移動量
+                startY: 0,       // ドラッグ開始時のマウスY座標
+                itemHeight: 0,   // 要素1つ分の高さ
+
+                // 表示モード
+                screenMode: 1,
+                SCREEN_MODE_MAIN: 1,
+                SCREEN_MODE_TRUSH: 2,
+                SCREEN_MODE_SETTINGS: 3,
+            };
+
+            // セーブデータをロード
+            let loadData = loadFromLocalStorage();
+            appData.tasks = loadData.tasks;
+            appData.trush = loadData.trush;
+            if (appData.tasks.length > 0) {
+                appData.selected = appData.tasks[0];
+            }
+
+            return appData;
+        },
+        methods: {
+            onClickAddTodo: onClickAddTodo,
+            onClickMoveToTrush: onClickMoveToTrush,
+            onClickRestoreTodo: onClickRestoreTodo,
+            onClickDeleteTodo: onClickDeleteTodo,
+            onClickSave: onClickSave,
+            onClickTodoCard: onClickTodoCard,
+
+            // ドラッグ & ドロップ用
+            onMouseDown: onMouseDown,
+            onMouseMove: onMouseMove,
+            onMouseUp: onMouseUp,
+            getItemStyle: getItemStyle,
+        },
+        watch: {
+            tasks: {
+                handler(newValue, oldValue) {
+                    autoSave();
+                },
+                deep: true
+            },
+            trush: {
+                handler(newValue, oldValue) {
+                    autoSave();
+                },
+                deep: true
+            },
+            'tasks.length': {
+                handler(newValue, oldValue) {
+                    // 要素数の変動が合ったら、選択状態のタスクと編集エリアの同期をとる。
+                    // タスク削除のタイミングでも良いけど、ここのほうが確実そう。
+                    if (this.selected == SELECTED_NONE) {
+                        return;
+                    }
+
+                    // 選択状態のタスクが、もうタスク一覧にない時
+                    if (!this.tasks.find(x => x.id == this.selected.id)) {
+                        console.log("選択状態のタスクが消された");
+                        this.selected = SELECTED_NONE;
+                    }
+                }
+            }
+        }
+    }).mount("#app");
+});
+
+// ------------------------------------------------------------------------------------------------
+// Vue イベントハンドラ
+// ------------------------------------------------------------------------------------------------
+// 追加
+function onClickAddTodo(e) {
+    this.tasks.unshift(new Task());
+}
+
+// 削除
+function onClickMoveToTrush(e, taskID) {
+    let removeTask = this.tasks.find(x => x.id == taskID);
+    this.trush.unshift(removeTask);
+    this.tasks = this.tasks.filter(x => x.id != taskID);
+}
+
+// 元に戻す
+function onClickRestoreTodo(e, taskID) {
+    let doneTask = this.trush.find(x => x.id == taskID);
+    this.tasks.push(doneTask);
+    this.trush = this.trush.filter(x => x.id != taskID);
+}
+
+// 完全削除
+function onClickDeleteTodo(e, taskID) {
+    this.trush = this.trush.filter(x => x.id != taskID);
+}
+
+// 保存
+function onClickSave(e) {
+    saveToLocalStorage();
+}
+
+// TODOのカードが押されたとき
+function onClickTodoCard(e, task) {
+    // 削除ボタンは発火させない（選択状態の判定が狂うので）
+    if (e.srcElement.classList.contains("todocard__trushbtn")) {
+        return;
+    }
+    this.selected = task;
+}
+
+function onMouseDown(index, event) {
+    // input要素をクリックした場合は文字入力させたいので、ドラッグを発動しない
+    if (event.target.tagName.toLowerCase() === 'input') return;
+
+    this.dragIndex = index;
+    this.hoverIndex = index;
+    this.startY = event.pageY;
+    this.dragOffsetY = 0;
+
+    // 要素の高さを取得（CSSでマージンがある場合はここで微調整します）
+    this.itemHeight = event.currentTarget.offsetHeight + 0;
+
+    // 画面外にマウスが出ても追従できるように document に対してイベントを貼る
+    this._onMouseMove = this.onMouseMove.bind(this);
+    this._onMouseUp = this.onMouseUp.bind(this);
+    document.addEventListener('mousemove', this._onMouseMove);
+    document.addEventListener('mouseup', this._onMouseUp);
+}
+
+function onMouseMove(event) {
+    if (this.dragIndex === -1) return;
+
+    // マウスの移動量を計算
+    this.dragOffsetY = event.pageY - this.startY;
+
+    // 移動量 ÷ 要素の高さ で「何個分の要素をまたいだか」を計算
+    let moveCount = Math.round(this.dragOffsetY / this.itemHeight);
+    let newHoverIndex = this.dragIndex + moveCount;
+
+    // 一番上や一番下を突き抜けないように制限
+    if (newHoverIndex < 0) newHoverIndex = 0;
+    if (newHoverIndex >= this.tasks.length) newHoverIndex = this.tasks.length - 1;
+
+    this.hoverIndex = newHoverIndex;
+}
+
+function onMouseUp(event) {
+    document.removeEventListener('mousemove', this._onMouseMove);
+    document.removeEventListener('mouseup', this._onMouseUp);
+
+    // もし元の位置から別の位置に移動していたら、DOMではなく「データ(tasks配列)」を入れ替える
+    if (this.dragIndex !== -1 && this.hoverIndex !== -1 && this.dragIndex !== this.hoverIndex) {
+        // ドラッグしていたタスクを配列から抜き出し、新しい位置に挿入する
+        const task = this.tasks.splice(this.dragIndex, 1)[0];
+        this.tasks.splice(this.hoverIndex, 0, task);
+    }
+
+    // 状態を初期化
+    this.dragIndex = -1;
+    this.hoverIndex = -1;
+    this.dragOffsetY = 0;
+}
+
+function getItemStyle(index) {
+    // 平常時は transform なし
+    if (this.dragIndex === -1) {
+        return {
+            // transition: 'transform 0.2s ease',
+            transition: 'none',
+            transform: 'translateY(0px)'
+        };
+    }
+
+    // 現在ドラッグしている要素は、マウスの移動量(dragOffsetY)に追従させる
+    if (index === this.dragIndex) {
+        return {
+            transform: `translateY(${this.dragOffsetY}px)`,
+            zIndex: 100,
+            position: 'relative',
+            transition: 'none' // マウスにピッタリ追従させるためアニメーションを切る
+        };
+    }
+
+    // ドラッグ中の要素以外で、入れ替わりを演出するための計算
+    let shiftY = 0;
+    if (this.dragIndex < this.hoverIndex) {
+        // 下へドラッグ中：追い越された要素は「上」へスライドして避ける
+        if (index > this.dragIndex && index <= this.hoverIndex) {
+            shiftY = -this.itemHeight;
+        }
+    } else if (this.dragIndex > this.hoverIndex) {
+        // 上へドラッグ中：追い越された要素は「下」へスライドして避ける
+        if (index < this.dragIndex && index >= this.hoverIndex) {
+            shiftY = this.itemHeight;
+        }
+    }
+
+    return {
+        transform: `translateY(${shiftY}px)`,
+        transition: 'transform 0.2s ease', // スムーズに避けるアニメーション
+        position: 'relative'
+    };
+}
+
+// ------------------------------------------------------------------------------------------------
+// その他
+// ------------------------------------------------------------------------------------------------
+function saveToLocalStorage() {
+    let saveData = {
+        tasks: app.tasks,
+        trush: app.trush,
+    };
+
+    console.log("save");
+
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(saveData));
+    showSaveMessage();
+}
+
+function loadFromLocalStorage() {
+    let loadDataRaw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (!loadDataRaw) {
+        return { tasks: [], trush: []};
+    }
+
+    let loadData = JSON.parse(loadDataRaw);
+    if (typeof loadData !== "object") {
+        return { tasks: [], trush: []};
+    }
+
+    if (loadData.tasks == false || Array.isArray(loadData.tasks) == false) {
+        loadData.tasks = [];
+    }
+    if (loadData.trush == false || Array.isArray(loadData.trush) == false) {
+        loadData.trush = [];
+    }
+    return loadData;
+}
+
+function autoSave() {
+    if (savetimer) {
+        clearTimeout(savetimer);
+    }
+
+    savetimer = setTimeout(() => {
+        saveToLocalStorage();
+    }, AUTO_SAVE_MSEC);
+}
+
+function showSaveMessage() {
+    const messageEl = document.getElementById('message');
+    messageEl.classList.remove('is-active');
+    void messageEl.offsetWidth;
+    messageEl.classList.add('is-active');
+}
+    </script>
+    <style>
+:root {
+    --color-font: #222;
+    --color-border: #CCC;
+}
+
+* {
+    font-family: Meiryo, sans-serif;
+    color: var(--color-font);
+    font-size: 12px;
+}
+
+body {
+    margin: 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5 {
+    margin: 0;
+    padding: 0;
+}
+
+ul {
+    padding: 0;
+}
+
+li {
+    list-style: none;
+}
+
+input {
+    display: inline-block;
+}
+
+p {
+    margin: 0;
+    padding: 0;
+}
+
+h2 {
+    font-size: 1.25rem;
+}
+
+button {
+    border: none;
+    background: none;
+}
+
+ul {
+    padding: 0;
+    margin: 0;
+}
+
+.top-outer {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ヘッダー */
+.header {
+    border-bottom: 1px solid var(--color-border);
+    padding: 5px;
+    display: flex;
+    overflow: hidden;
+}
+
+.header__title {
+    font-size: 1.5rem;
+}
+
+.header__message {
+    margin-left: auto;
+    font-size: 1.0rem;
+    display: flex;
+    align-items: end;
+    opacity: 0;
+    color: rgb(255, 0, 0);
+}
+
+.header__setting {
+    margin-left: 20px;
+}
+
+/* JavaScriptで動的に付与するクラス */
+.header__message.is-active {
+    animation: autoSaveMessage 4.0s forwards;
+}
+
+/* アニメーションの定義 */
+@keyframes autoSaveMessage {
+    0% {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+    12.5% {
+        transform: translateX(0);
+        opacity: 1;
+    }
+    87.5% {
+        transform: translateX(0);
+        opacity: 1;
+    }
+    100% {
+        transform: translateX(-100%);
+        opacity: 0;
+    }
+}
+
+/* メインコンテナ */
+.main {
+    padding: 10px;
+    background-color: #f3f3f3;
+    flex: 1;
+    height: 100%;
+}
+
+.todo {
+    margin-bottom: 1rem;
+}
+
+.todo>* {
+    margin-bottom: 0.5rem;
+}
+
+/* TODO 一覧エリア */
+.todolist {
+    position: relative;
+}
+
+/* TODO タスクカード */
+.todocard {
+    border-radius: 5px;
+    display: flex;
+    height: 2.0rem;
+    padding: 0.25rem;
+    background-color: #FFF;
+    position: relative;
+    gap: 0.25rem;
+}
+
+.todocard.todocard--trush {
+    display: block;
+    height: auto;
+}
+
+.todocard--trush__head {
+    display: flex;
+    gap: 0.25rem;
+}
+
+.todocard--trush__desc {
+    white-space: pre-wrap;
+    padding-left: 1.25rem;
+    color: #666;
+}
+
+/* 枠線 */
+.todocard::after {
+    position: absolute;
+    top: -0.5px;
+    left: -0.5px;
+    display: block;
+    width: calc(100% - 1px);
+    height: calc(100% - 1px);
+    pointer-events: none;
+    content: '';
+    border: 1px solid var(--color-border);
+    border-radius: 5px;
+}
+
+.todocard.todocard--selected::after {
+    top: 0px;
+    left: 0px;
+    display: block;
+    width: calc(100% - 4px);
+    height: calc(100% - 4px);
+    pointer-events: none;
+    content: '';
+    border: 2px solid rgb(116, 176, 255);
+}
+
+
+.todocard--draggable {
+    cursor: grab;
+}
+
+/* ハンドル */
+.todocard.todocard--draggable::before {
+    display: block;
+    width: 25px;
+    height: 100%;
+    content: '';
+
+    /* マウスカーソルを「つかむ」アイコンにする */
+    cursor: grab;
+
+    /* 6つのドットを定義 (色は #a3a3a3 を指定) */
+    background-image:
+        radial-gradient(circle, #a3a3a3 50%, transparent 60%),
+        /* 上・左 */
+        radial-gradient(circle, #a3a3a3 50%, transparent 60%),
+        /* 上・右 */
+        radial-gradient(circle, #a3a3a3 50%, transparent 60%),
+        /* 中・左 */
+        radial-gradient(circle, #a3a3a3 50%, transparent 60%),
+        /* 中・右 */
+        radial-gradient(circle, #a3a3a3 50%, transparent 60%),
+        /* 下・左 */
+        radial-gradient(circle, #a3a3a3 50%, transparent 60%);
+    /* 下・右 */
+
+    /* 1つのドットのサイズ (直径4px) */
+    background-size: 4px 4px;
+    background-repeat: no-repeat;
+
+    /* 25px幅の中央、かつ縦の中央に配置 */
+    background-position:
+        7px calc(50% - 6px), 14px calc(50% - 6px),
+        /* 上の行 (左, 右) */
+        7px 50%, 14px 50%,
+        /* 中の行 (左, 右) */
+        7px calc(50% + 6px), 14px calc(50% + 6px);
+    /* 下の行 (左, 右) */
+}
+
+.todocard--dragged {
+    opacity: 0.9;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.todocard__title {
+    outline: none;
+    border: none;
+    padding: 0px;
+    border-radius: 3px;
+    flex: 1;
+    line-height: 0.6rem;
+    background-color: inherit;
+    margin-right: 0.5rem;
+}
+
+.todocard__title:focus {
+    background-color: #FFF;
+    outline: 1px solid var(--color-border)
+}
+
+.todocard__donetitle {
+    flex: 1;
+    align-self: center;
+    padding-left: 0.5rem;
+}
+
+/* 編集エリア */
+.edit__inner {
+    width: 100%;
+}
+
+.edit__miniheader {
+    color: #AAA;
+}
+
+.edit__textarea {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--color-border);
+    border-radius: 3px;
+}
+
+.edit__textarea--title {}
+
+.edit__textarea--readonly {
+    background-color: #EEE;
+}
+
+.split {
+    height: 0px;
+    border-top: 3px solid #AAA;
+    border-bottom: 2px solid #DDD;
+    margin-bottom: 1rem;
+}
+
+.screenModeChange {
+    display: flex;
+    gap: 5px;
+}
+
+.btn-style1 {
+    font-size: 0.80rem;
+    border: 1px solid #AAA;
+    border-radius: 1em;
+    height: 2em;
+    background-color: #FFF;
+}
+
+.btn-style1--inactive {
+    color: #AAA;
+    background-color: #EEE;
+}
+
+.btn-style2 {
+    border: 1px solid rgb(88, 189, 167);
+    padding: 0.25em;
+    background-color: #ffffff;
+    border-radius: 3px;
+    padding: 0.25em 1em;
+}
+
+.btn-style2:hover {
+    background-color: rgba(0, 255, 21, 0.137);
+}
+
+.btn-style2:active {
+    background-color: rgba(0, 255, 21, 0.25);
+    transform: scale(0.98);
+}
+
+.screenModeChange {
+    margin-bottom: 1rem;
+}
+
+/* 設定系 */
+.settings-screen {
+    background-color: white;
+    border: 1px solid var(--color-border);
+    border-radius: 5px;
+    padding: 5px;
+
+    min-height: 100px;
+}
+
+.settings-element__check {
+    display: flex;
+    align-items: center;
+}
+
+.settings-element__desc {
+    padding-left: 2rem;
+    color: #666;
+}
+    </style>
+    <title>TODO</title>
+</head>
+
+<body>
+    <div id="app">
+        <div class="top-outer">
+            <header class="header">
+                <h1 class="header__title">TODO</h1>
+                <p class="header__message" id="message">自動保存しました</p>
+            </header>
+            <div class="main">
+                <div class="screenModeChange">
+                    <button class="btn-style1" :class="{'btn-style1--inactive':screenMode != SCREEN_MODE_MAIN}" @click="screenMode = SCREEN_MODE_MAIN">メイン</button>
+                    <button class="btn-style1" :class="{'btn-style1--inactive':screenMode != SCREEN_MODE_TRUSH}" @click="screenMode = SCREEN_MODE_TRUSH">ゴミ箱</button>
+                    <button class="btn-style1" :class="{'btn-style1--inactive':screenMode != SCREEN_MODE_SETTINGS}" @click="screenMode = SCREEN_MODE_SETTINGS">設定</button>
+                </div>
+                <div v-if="screenMode==SCREEN_MODE_MAIN" class="main-screen">
+                    <div class="todo">
+                        <div>
+                            <button class="btn-style2" @click="onClickAddTodo">追加</button>
+                        </div>
+                        <ul class="todolist">
+                            <li v-for="(task, index) in tasks"
+                                :key="task.id"
+                                :id="task.id"
+                                class="todocard todocard--draggable"
+                                :class="{ 'todocard--dragged': dragIndex === index, 'todocard--selected': task.id === selected.id }"
+                                @click="onClickTodoCard($event, task)"
+                                @mousedown="onMouseDown(index, $event)"
+                                :style="getItemStyle(index)">
+                                <input class="todocard__title" v-model="task.title" type="text">
+                                <button class="todocard__trushbtn btn-style2" @click="onClickMoveToTrush($event, task.id)">×</button>
+                            </li>
+                        </ul>
+                    </div>
+
+                    <div class="split">
+                    </div>
+
+                    <div class="edit">
+                        <div class="edit__inner">
+                            <h3 class="edit__miniheader">タイトル</h3>
+                            <textarea rows="1" class="edit__textarea edit__textarea--title" v-if="typeof selected === 'object'" name="" id="" v-model="selected.title"></textarea>
+                            <textarea rows="1" class="edit__textarea edit__textarea--title edit__textarea--readonly" v-else readonly placeholder="(未選択)" value=""></textarea>
+                            <h3 class="edit__miniheader">内容</h3>
+                            <textarea rows="8" class="edit__textarea edit__textarea--desc" v-if="typeof selected === 'object'" name="" id="" v-model="selected.desc"></textarea>
+                            <textarea rows="8" class="edit__textarea edit__textarea--desc edit__textarea--readonly" v-else readonly placeholder="(未選択)" value=""></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <div v-if="screenMode==SCREEN_MODE_TRUSH" class="trush-screen">
+                    <div class="todo">
+                        <ul class="todolist">
+                            <li v-for="(task, index) in trush"
+                                class="todocard todocard--trush"
+                                :key="task.id"
+                                :id="'done' + task.id">
+                                <div class="todocard--trush__head">
+                                    <p class="todocard__donetitle">{{task.title}}</p>
+                                    <button class="btn-style2" @click="onClickRestoreTodo($event, task.id)">元に戻す</button>
+                                    <button class="btn-style2" @click="onClickDeleteTodo($event, task.id)">削除</button>
+                                </div>
+                                <p class="todocard--trush__desc">{{task.desc}}</p>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div v-if="screenMode==SCREEN_MODE_SETTINGS" class="settings-screen">
+                    <div class="settings-element">
+                        <label class="settings-element__check"><input type="checkbox" name="autosave" ><span>ダミー</span></label>
+                        <p class="settings-element__desc">ダミーの説明文<br></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>
